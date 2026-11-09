@@ -1,0 +1,15 @@
+.venv/
+*.db*
+*.secret
+browser-session/
+browsers/
+cache/
+logs/
+drafts/
+evidence/
+profile.json
+settings.json
+RESUME.pdf
+applications.json
+last-run.json
+__pycache__/
