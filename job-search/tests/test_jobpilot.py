@@ -41,6 +41,14 @@ class CoreTests(unittest.TestCase):
         with patch.object(jp,'cached_json',return_value=data):
             jobs,errors=jp.discover({'sources':[{'type':'greenhouse','url':'https://example.com/api','company':'Example'}]})
         self.assertFalse(errors); self.assertTrue(jobs[0]['eligible']); self.assertEqual(jobs[0]['source'],'Employer')
+    def test_extra_sources_and_country_restrictions(self):
+        from discovery import postings,source_for
+        source={'type':'lever','url':'https://api.lever.co/v0/postings/example?mode=json','company':'Example'}
+        data=[{'text':'Junior React Developer','categories':{'location':'Remote - United States'},'workplaceType':'remote','hostedUrl':'https://example.com/job'}]
+        self.assertFalse(list(postings(source,data))[0]['eligible'])
+        data[0]['categories']['location']='Remote - EMEA'
+        self.assertTrue(list(postings(source,data))[0]['eligible'])
+        self.assertEqual(source_for('https://jobs.ashbyhq.com/Example')['type'],'ashby')
     def test_draft_does_not_claim_graduation(self):
         j=job(); j['skills']='["React"]'
         text=jp.draft(j,PROFILE)
@@ -69,6 +77,20 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(jp,'discover',return_value=([job()],[])),patch.object(jp,'fetch',side_effect=OSError('blocked')),patch('browser_apply.apply',return_value={'status':'blocked','reason':'Fixture CAPTCHA'}) as browser:
             jp.run(); self.assertEqual(browser.call_count,1)
             with jp.db() as c: self.assertEqual(c.execute('SELECT reason FROM jobs').fetchone()['reason'],'Fixture CAPTCHA')
+    def test_retry_cooldown_uses_attempt_time_not_discovery_time(self):
+        from datetime import datetime,timedelta
+        with patch.object(jp,'discover',return_value=([job()],[])),patch.object(jp,'fetch',return_value=('<p>Apply here</p>','https://example.com')),patch('browser_apply.apply',return_value={'status':'blocked','reason':'Fixture CAPTCHA'}) as browser:
+            jp.run()
+            with jp.db() as c:
+                c.execute('UPDATE jobs SET attempted_at=?,updated=?',((datetime.now(jp.TZ)-timedelta(hours=25)).isoformat(),jp.now()))
+            jp.run(); jp.run()
+            self.assertEqual(browser.call_count,2)
+    def test_user_skip_survives_rediscovery(self):
+        with patch.object(jp,'discover',return_value=([job()],[])):
+            jp.run(dry=True)
+            with jp.db() as c: c.execute("UPDATE jobs SET status='excluded',reason='Status updated by user'")
+            jp.run(dry=True)
+            with jp.db() as c: self.assertEqual(c.execute('SELECT status FROM jobs').fetchone()['status'],'excluded')
     def test_uncertain_delivery_never_automatically_retries(self):
         data=job()
         with patch.object(jp,'discover',return_value=([data],[])),patch.object(jp,'fetch',return_value=('<p>Send your CV to careers@example.com</p>',data['url'])),patch.object(jp,'password',return_value='fixture'),patch.object(jp,'deliver_email',side_effect=TimeoutError) as send:

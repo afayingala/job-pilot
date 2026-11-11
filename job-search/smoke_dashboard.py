@@ -18,6 +18,9 @@ with sync_playwright() as pw:
     page.get_by_label('SMTP server',exact=True).wait_for()
     assert page.get_by_label('Submit matching applications automatically',exact=True).is_checked()
     assert page.get_by_role('button',name='Open job-site browser',exact=True).is_visible()
+    assert page.locator('#savedanswers').is_visible()
+    assert page.get_by_role('button',name='Sign in with Google',exact=True).is_visible()
+    assert page.get_by_label('Google Desktop OAuth credentials JSON',exact=True).count()==1
     page.screenshot(path=str(root/'evidence'/'jobpilot-settings.png'),full_page=False)
     page.get_by_role('button',name='Applications',exact=True).click()
     assert page.locator('#filter').input_value()=='active'

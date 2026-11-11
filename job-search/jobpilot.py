@@ -18,7 +18,7 @@ PORT = 8765
 DEFAULT = {"auto_apply": True, "paused": False, "max_applications": 10,
            "min_score": 55, "browser_enabled": True,
            "smtp_host": "smtp.gmail.com", "smtp_port": 465,
-           "smtp_user": "afayingala67@gmail.com", "smtp_tls": "ssl",
+           "smtp_user": "afa974828@gmail.com", "smtp_tls": "ssl",
            "sources": [
                {"type": "himalayas", "url": "https://himalayas.app/jobs/api/search"},
                {"type": "remotive", "url": "https://remotive.com/api/remote-jobs?category=software-dev"},
@@ -84,12 +84,12 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         validate_url(newurl)
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
-def fetch(url):
+def fetch(url,max_bytes=4_000_000):
     validate_url(url)
     req=urllib.request.Request(url,headers={"User-Agent":"JobPilot/1.0 (personal job search)","Accept":"application/json,text/html"})
     with urllib.request.build_opener(SafeRedirect()).open(req,timeout=20) as r:
-        data=r.read(4_000_001)
-        if len(data)>4_000_000: raise ValueError('Source response too large')
+        data=r.read(max_bytes+1)
+        if len(data)>max_bytes: raise ValueError('Source response too large')
         return data.decode('utf-8',errors='replace'),r.geturl()
 
 class ClosingConnection(sqlite3.Connection):
@@ -115,6 +115,9 @@ def init():
         discovered INTEGER DEFAULT 0,matched INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,errors TEXT);
         CREATE TABLE IF NOT EXISTS slots(slot TEXT PRIMARY KEY,started TEXT);
         ''')
+        if 'attempted_at' not in [r[1] for r in c.execute('PRAGMA table_info(jobs)')]:
+            c.execute('ALTER TABLE jobs ADD COLUMN attempted_at TEXT')
+            c.execute('UPDATE jobs SET attempted_at=updated WHERE attempts>0')
         # Never repeat a potentially successful attempt inherited from the earlier workflow.
         for j in read_json(ROOT/'applications.json',{}).get('applications',[]):
             status=j.get('status','prospect_not_submitted')
@@ -180,18 +183,18 @@ def job_from_ld(v,url):
             'url':v.get('url') or url,'location':loc,'description':Page(v.get('description','')).text,
             'deadline':v.get('validThrough'),'eligible':eligible,'source':'Employer','source_url':url}
 
-def cached_json(url,max_age=21600):
+def cached_json(url,max_age=14400):
     path=ROOT/'cache'/(hashlib.sha256(url.encode()).hexdigest()+'.json')
     if path.exists() and time.time()-path.stat().st_mtime<max_age: return read_json(path,{})
-    raw,_=fetch(url); data=json.loads(raw); write_json(path,data); return data
+    raw,_=fetch(url,max_bytes=16_000_000); data=json.loads(raw); write_json(path,data); return data
 
 def discover(cfg):
     jobs=[]; errors=[]
     for source in cfg['sources']:
         try:
             if source['type']=='himalayas':
-                for query in ('frontend','full stack','python','react native','QA'):
-                    for page in range(1,4):
+                for query in cfg.get('search_queries',('frontend','full stack','python','react native','QA','Vue','Node.js','FastAPI','software intern','backend','TypeScript','JavaScript')):
+                    for page in range(1,int(cfg.get('search_pages',5))+1):
                         url=source['url']+'?'+urllib.parse.urlencode({'q':query,'country':'CM','seniority':'Entry-level','timezone':'UTC+1','page':page})
                         data=cached_json(url); batch=data.get('jobs',[])
                         for v in batch:
@@ -214,6 +217,11 @@ def discover(cfg):
                     jobs.append({'title':v['title'],'company':source.get('company','Employer'),'url':v['absolute_url'],
                         'description':Page(html.unescape(v.get('content',''))).text,'location':loc,'eligible':eligible,
                         'deadline':None,'source':'Employer','source_url':v['absolute_url']})
+            elif source['type'] in ('lever','ashby'):
+                from discovery import postings
+                for j in postings(source,cached_json(source['url'])):
+                    j['description']=Page(j['description']).text
+                    jobs.append(j)
             elif source['type']=='careers':
                 raw,url=fetch(source['url']); doc=Page(raw)
                 for v in doc.scripts:
@@ -283,6 +291,12 @@ def connect_smtp(cfg):
     except Exception: client.close(); raise
     return client
 
+def email_ready(cfg):
+    if cfg.get('email_provider')=='google':
+        from google_mail import status
+        return status(ROOT,cfg['smtp_user'])['connected']
+    return bool(password())
+
 def application_email(doc):
     # Only use an explicitly instructed application address, never generic contact footers.
     text=html.unescape(doc.text)
@@ -298,12 +312,16 @@ def deliver_email(j,cfg,p):
     msg['Reply-To']=p['email']; msg['Subject']=f"Application - {j['title']} - {p['name']}"
     msg['Message-ID']=make_msgid(domain=cfg['smtp_user'].split('@')[-1]); msg.set_content(j['draft'])
     msg.add_attachment((ROOT/'RESUME.pdf').read_bytes(),maintype='application',subtype='pdf',filename='Afayi_Ngala_Resume.pdf')
+    if cfg.get('email_provider')=='google':
+        from google_mail import send
+        return send(ROOT,cfg['smtp_user'],msg)
     with connect_smtp(cfg) as smtp:
         rejected=smtp.send_message(msg)
         if rejected: raise RuntimeError('Mail server rejected recipient')
     return 'SMTP accepted message '+str(msg['Message-ID'])+'; employer receipt not independently confirmed'
 
 def update(jid,**fields):
+    if fields.get('status')=='submitting': fields['attempted_at']=now()
     fields['updated']=now()
     with db() as c: c.execute('UPDATE jobs SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',list(fields.values())+[jid])
 
@@ -343,9 +361,10 @@ def _run(dry):
             with db() as c:
                 previous=c.execute("SELECT company,title FROM jobs WHERE status IN ('submitted','submission_uncertain','submitting')").fetchall()
                 if any(identity(x['company'],x['title'])==identity(j['company'],j['title']) for x in previous): continue
-                existing=c.execute('SELECT status FROM jobs WHERE id=?',(jid,)).fetchone()
+                existing=c.execute('SELECT * FROM jobs WHERE id=?',(jid,)).fetchone()
                 if existing:
                     if existing['status'] in ('submitted','submission_uncertain','submitting'): continue
+                    if existing['status']=='excluded' and existing['reason']=='Status updated by user': continue
                     old_status=existing['status']
                     next_status=status if old_status in ('matched','excluded') else old_status
                     c.execute('UPDATE jobs SET score=?,skills=?,description=?,location=?,status=?,reason=CASE WHEN status IN (\'matched\',\'excluded\') THEN ? ELSE reason END,updated=? WHERE id=?',(score,json.dumps(skills),j['description'],j.get('location',''),next_status,reason,now(),jid))
@@ -360,7 +379,12 @@ def _run(dry):
             if dry or not cfg['auto_apply'] or status=='needs_review': continue
             if sent>=int(cfg['max_applications']): continue
             if attempted>=int(cfg['max_applications'])*2: continue
-            if row['status'] in ('needs_review','blocked','failed'): continue
+            if row['status'] in ('needs_review','failed'): continue
+            if row['status']=='blocked' and not (row['reason']=='Email account not connected' and email_ready(cfg)):
+                # A failed preparation can be retried after a cooldown. Never retry uncertain sends.
+                try: age=(datetime.now(TZ)-datetime.fromisoformat(existing['attempted_at'] or existing['created'])).total_seconds()
+                except (ValueError,TypeError): age=0
+                if age<int(cfg.get('retry_hours',24))*3600: continue
             # Refresh original application page immediately before attempting delivery.
             doc=None
             try:
@@ -374,7 +398,7 @@ def _run(dry):
             # Aggregator page is a lead; browser may follow its Apply link.
             recipient=application_email(doc) if doc and j['source']=='Employer' else None
             if recipient:
-                if not password(): update(jid,status='blocked',reason='Email account not connected'); continue
+                if not email_ready(cfg): update(jid,status='blocked',reason='Email account not connected'); continue
                 update(jid,email=recipient,status='submitting',attempts=row['attempts']+1)
                 row.update(email=recipient,draft=body)
                 try: receipt=deliver_email(row,cfg,p)
@@ -409,7 +433,9 @@ def state():
     with db() as c:
         jobs=[dict(x) for x in c.execute('SELECT * FROM jobs ORDER BY score DESC,updated DESC LIMIT 500')]
         runs=[dict(x) for x in c.execute('SELECT * FROM runs ORDER BY id DESC LIMIT 15')]
-    return {'settings':cfg,'profile':profile(),'jobs':jobs,'runs':runs,'email_connected':bool(password()),'running':LOCK.locked(),
+        active=c.execute("SELECT started FROM slots WHERE slot='running'").fetchone()
+    from google_mail import status as google_status
+    return {'settings':cfg,'profile':profile(),'jobs':jobs,'runs':runs,'email_connected':email_ready(cfg),'google':google_status(ROOT,cfg['smtp_user']),'running':LOCK.locked() or bool(active),
             'schedule':['12:00','17:00'],'timezone':'Cameroon UTC+1','token':TOKEN}
 
 class Handler(BaseHTTPRequestHandler):
@@ -449,10 +475,27 @@ class Handler(BaseHTTPRequestHandler):
                     with db() as c: c.execute("UPDATE jobs SET status='matched',reason='Email connected; queued for next run' WHERE status='blocked' AND reason='Email account not connected'")
                 return self.respond({'saved':True})
             if self.path=='/api/email-test':
+                if config().get('email_provider')=='google':
+                    from google_mail import test_connection
+                    return self.respond(test_connection(ROOT,config()['smtp_user']))
                 with connect_smtp(config()) as smtp: smtp.noop()
                 return self.respond({'ok':True,'message':'Email login verified. No message sent.'})
+            if self.path=='/api/google/setup':
+                from google_mail import save_client
+                save_client(ROOT,data.get('credentials'))
+                cfg=config(); cfg['email_provider']='google'; write_json(ROOT/'settings.json',cfg)
+                return self.respond({'saved':True})
+            if self.path=='/api/google/connect':
+                from google_mail import start
+                cfg=config(); cfg['email_provider']='google'; write_json(ROOT/'settings.json',cfg)
+                return self.respond(start(ROOT,cfg['smtp_user']))
             if self.path=='/api/profile':
                 p=profile()
+                if 'answers' in data:
+                    answers=data['answers']
+                    if not isinstance(answers,dict) or len(answers)>100: raise ValueError('Provide at most 100 question-answer pairs')
+                    if any(not isinstance(k,str) or not isinstance(v,str) or len(k)>500 or len(v)>2000 for k,v in answers.items()): raise ValueError('Invalid saved answer')
+                    p['answers']=answers
                 for k in ('availability','citizenship','work_authorization','expected_hourly_rate','salary_expectation'):
                     if k in data:
                         value=str(data[k]).strip()
@@ -460,6 +503,7 @@ class Handler(BaseHTTPRequestHandler):
                         p[k]=value or None
                 if 'completed_confirmed' in data: p['degree']['completed_confirmed']=bool(data['completed_confirmed'])
                 write_json(ROOT/'profile.json',p)
+                with db() as c: c.execute("UPDATE jobs SET status='matched',reason='Profile answers updated; queued for next run' WHERE status='blocked' AND reason LIKE 'Required answers unavailable:%'")
                 return self.respond({'saved':True})
             if self.path=='/api/browser-login':
                 subprocess.Popen([sys.executable,str(ROOT/'jobpilot.py'),'--browser-login'],cwd=str(ROOT),
@@ -467,8 +511,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({'opened':True})
             if self.path=='/api/source':
                 cfg=config(); url=validate_url(data['url']); typ=data.get('type','careers')
+                from discovery import source_for
+                inferred=source_for(url,data.get('company',''))
+                if inferred:
+                    if not any(s['url']==inferred['url'] for s in cfg['sources']): cfg['sources'].append(inferred)
+                    write_json(ROOT/'settings.json',cfg); return self.respond({'saved':True})
                 if urllib.parse.urlsplit(url).hostname=='boards-api.greenhouse.io': typ='greenhouse'
-                if typ not in ('careers','himalayas','remotive','greenhouse'): raise ValueError('Unsupported source')
+                if typ not in ('careers','himalayas','remotive','greenhouse','lever','ashby'): raise ValueError('Unsupported source')
                 if not any(s['url']==url for s in cfg['sources']): cfg['sources'].append({'type':typ,'url':url})
                 write_json(ROOT/'settings.json',cfg); return self.respond({'saved':True})
             if self.path=='/api/job':

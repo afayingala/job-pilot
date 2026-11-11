@@ -1,6 +1,21 @@
 """Conservative browser adapter: fills known facts; submits only complete ordinary forms."""
-import json, re
+import json, re, unicodedata
 from pathlib import Path
+
+def clean_label(value):
+    value=re.sub(r'([a-z])([A-Z])',r'\1 \2',value)
+    s=''.join(c for c in unicodedata.normalize('NFKD',value).lower() if not unicodedata.combining(c))
+    s=re.sub(r'[_\-*?:]+',' ',s)
+    return re.sub(r'\s+',' ',s).strip()
+
+def supplied_answer(label,profile):
+    key=clean_label(label)
+    return next((value for question,value in profile.get('answers',{}).items() if clean_label(question)==key),None)
+
+FIELD_INFO='''e=>{
+ const labelText=l=>{if(!l)return '';const copy=l.cloneNode(true);copy.querySelectorAll('input,select,textarea,button').forEach(x=>x.remove());return copy.textContent.trim()};
+ return {tag:e.tagName,type:e.type,name:e.name,id:e.id,required:e.required||e.getAttribute('aria-required')==='true',aria:e.getAttribute('aria-label'),placeholder:e.getAttribute('placeholder'),labels:Array.from(e.labels||[]).map(labelText).join(' ')||((e.getAttribute('aria-labelledby')||'').split(' ').map(id=>document.getElementById(id)?.innerText||'').join(' ')).trim()||labelText(e.closest('label')),value:e.value}
+}'''
 
 def apply(job,profile,root,headless=True):
     try: from playwright.sync_api import sync_playwright
@@ -40,22 +55,47 @@ def apply(job,profile,root,headless=True):
                 ('salary_expectation',r'salary expectation|expected salary|salaire souhaite')]:
                 if profile.get(key): known[pattern]=profile[key]
             missing=[]
+            diagnostics=[]
             # Labels, placeholders and field names are visible form metadata, not generated answers.
             for field in page.locator('input,textarea,select').all():
-                if not field.is_visible() or not field.is_enabled(): continue
-                info=field.evaluate('e=>({tag:e.tagName,type:e.type,name:e.name,id:e.id,required:e.required,aria:e.getAttribute("aria-label"),placeholder:e.getAttribute("placeholder"),labels:Array.from(e.labels||[]).map(x=>x.innerText).join(" "),value:e.value})')
+                if not field.is_enabled(): continue
+                info=field.evaluate(FIELD_INFO)
                 typ=info['type'] or ''
                 if typ in ('hidden','submit','button','reset'): continue
                 label=next((str(info.get(k)).strip().rstrip('*').strip() for k in ('labels','aria','placeholder','name') if info.get(k)), '')
-                if typ=='file': field.set_input_files(str(root/'RESUME.pdf')); continue
+                label=clean_label(label)
+                if typ=='file':
+                    hint=label+' '+(info['name'] or '')+' '+(info['id'] or '')
+                    if re.search(r'cover|motivation',hint,re.I):
+                        letter=root/'drafts'/(job['id']+'-cover.txt'); letter.parent.mkdir(exist_ok=True)
+                        letter.write_text(job['draft'],encoding='utf-8')
+                        accept=field.get_attribute('accept') or ''
+                        if accept and 'txt' not in accept and 'text/plain' not in accept:
+                            if info['required']: missing.append('Cover letter upload requires another file format')
+                        else: field.set_input_files(str(letter))
+                    elif re.search(r'resume|curriculum|\bcv\b',hint,re.I) or page.locator('input[type="file"]').count()==1:
+                        field.set_input_files(str(root/'RESUME.pdf'))
+                    elif info['required']: missing.append(label or 'Unidentified document upload')
+                    continue
+                if not field.is_visible(): continue
+                diagnostics.append({'label':label,'required':bool(info['required']),'type':typ})
+                value=supplied_answer(label,profile) or next((v for k,v in known.items() if re.search(k,label,re.I)),None)
+                if info['tag']=='SELECT':
+                    if value:
+                        options=field.locator('option').all_text_contents()
+                        choices=[x for x in options if clean_label(x)==clean_label(value)]
+                        if len(choices)==1: field.select_option(label=choices[0])
+                    if info['required'] and not field.evaluate('e=>e.checkValidity()'): missing.append(label or 'required choice')
+                    continue
                 if typ in ('checkbox','radio') or info['tag']=='SELECT':
                     if info['required'] and not field.evaluate('e=>e.checkValidity()'): missing.append(label or 'required choice')
                     continue
-                value=next((v for k,v in known.items() if re.search(k,label,re.I)),None)
                 if value:
                     field.fill(value)
                 elif info['required'] and not info['value']: missing.append(label or 'unlabelled required field')
-            if missing: return {'status':'blocked','reason':'Required answers unavailable: '+', '.join(missing[:6])}
+            if missing:
+                (root/'evidence'/(job['id']+'-questions.json')).write_text(json.dumps(diagnostics,indent=2),encoding='utf-8')
+                return {'status':'blocked','reason':'Required answers unavailable: '+', '.join(missing[:6])}
             if re.search(r'by (?:submitting|applying).{0,120}(?:agree to.{0,30}terms|legally binding)|j.accepte.{0,80}conditions',text,re.I):
                 return {'status':'blocked','reason':'Application requires agreement to terms; review required'}
             buttons=page.get_by_role('button',name=re.compile(r'^(submit(?: application)?|send application|apply(?: now)?|envoyer ma candidature|soumettre la demande)$',re.I))

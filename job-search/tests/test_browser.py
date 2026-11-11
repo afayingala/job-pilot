@@ -44,5 +44,18 @@ class BrowserTests(unittest.TestCase):
         Fixture.extra='<p>By submitting you agree to our terms of service.</p>'
         result=apply(self.job,PROFILE,self.root)
         self.assertEqual(result['status'],'blocked',result); self.assertEqual(len(Fixture.submissions),0)
+    def test_aria_labelled_field_is_filled(self):
+        Fixture.extra='<span id="site-label">Portfolio</span><input aria-labelledby="site-label" required>'
+        result=apply(self.job,PROFILE,self.root)
+        self.assertEqual(result['status'],'submitted',result)
+    def test_hidden_resume_upload_is_supported(self):
+        Fixture.extra='<input type="file" name="resume_attachment" style="display:none" required>'
+        result=apply(self.job,PROFILE,self.root)
+        self.assertEqual(result['status'],'submitted',result)
+    def test_explicit_saved_select_answer_is_used(self):
+        Fixture.extra='<label>Preferred working hours<select name="hours" required><option value="">Choose</option><option>Afternoons</option></select></label>'
+        p=PROFILE|{'answers':{'Preferred working hours':'Afternoons'}}
+        result=apply(self.job,p,self.root)
+        self.assertEqual(result['status'],'submitted',result)
 
 if __name__=='__main__': unittest.main()
